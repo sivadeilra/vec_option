@@ -4,6 +4,7 @@
 
 use bit_vec::BitVec;
 use core::ops::Range;
+use core::mem::MaybeUninit;
 
 /// `VecOption` is a collection that is semantically equivalent to `Vec<Option<T>>` but which
 /// uses a different memory representation. This representation can be more efficient
@@ -61,20 +62,20 @@ pub struct VecOption<T> {
     ///
     /// For that reason, we restrict our usage of `vec` to only these methods:
     /// len(), push(), pop(), set_len()
-    vec: Vec<T>,
+    vec: Vec<MaybeUninit<T>>,
     present: BitVec,
 }
 
 impl<T: Clone> Clone for VecOption<T> {
     fn clone(&self) -> Self {
         let clone_capacity = self.vec.len();
-        let mut clone_vec: Vec<T> = Vec::with_capacity(clone_capacity);
+        let mut clone_vec: Vec<MaybeUninit<T>> = Vec::with_capacity(clone_capacity);
         for (i, item_present) in self.present.iter().enumerate() {
             if item_present {
                 unsafe {
                     core::ptr::write(
                         clone_vec.as_mut_ptr().add(i),
-                        (*self.vec.as_ptr().add(i)).clone(),
+                        MaybeUninit::new((*self.vec[i].as_ptr()).clone()),
                     );
                 }
             }
@@ -168,6 +169,26 @@ fn basic_test() {
     assert_eq!(v.get_copy(0), Some(333));
 }
 
+unsafe fn vec_to_uninit_vec<T>(mut vec: Vec<T>) -> Vec<MaybeUninit<T>> {
+    let result = Vec::from_raw_parts(
+        vec.as_mut_ptr() as *mut MaybeUninit<T>,
+        vec.len(),
+        vec.capacity()
+    );
+    core::mem::forget(vec);
+    result
+}
+
+unsafe fn vec_uninit_to_vec<T>(mut vec: Vec<MaybeUninit<T>>) -> Vec<T> {
+    let result = Vec::from_raw_parts(
+        vec.as_mut_ptr() as *mut T,
+        vec.len(),
+        vec.capacity(),
+    );
+    core::mem::forget(vec);
+    result
+}
+
 impl<T> VecOption<T> {
     /// Constructs a new, empty `VecOption<T>`.
     ///
@@ -201,7 +222,7 @@ impl<T> VecOption<T> {
         let len = vec.len();
         Self {
             present: BitVec::from_elem(len, true),
-            vec,
+            vec: unsafe { vec_to_uninit_vec(vec) },
         }
     }
 
@@ -220,10 +241,11 @@ impl<T> VecOption<T> {
     /// assert_eq!(v.into_iter().collect::<Vec<Option<i32>>>(), vec![None, None, None, Some(42)]);
     /// ```
     pub fn new_repeat_none(len: usize) -> Self {
-        let mut vec: Vec<T> = Vec::with_capacity(len);
+        let mut vec: Vec<MaybeUninit<T>> = Vec::with_capacity(len);
         unsafe {
             vec.set_len(len);
         }
+
         Self {
             vec,
             present: BitVec::from_elem(len, false),
@@ -256,9 +278,11 @@ impl<T> VecOption<T> {
         if a == b {
             return;
         }
-        let value_a = self.replace_none(a);
-        let value_b = self.replace(b, value_a);
-        self.replace(a, value_b);
+        self.vec.swap(a, b);
+        let a_present = self.present[a];
+        let b_present = self.present[b];
+        self.present.set(a, b_present);
+        self.present.set(b, a_present);
     }
 
     pub fn drain<R: std::ops::RangeBounds<usize>>(&mut self, range: R) -> Drain<T> {
@@ -290,7 +314,7 @@ impl<T> VecOption<T> {
     /// contiguous, starting at index 0. Returns a mutable slice over the contiguous `Some(T)` entries.
     /// The length of that slice is equal to the total number of `Some(T)` entries.
     ///
-    /// This method changes the length of the vector. After this
+    /// This method changes the length of the vector.
     ///
     /// Example:
     ///
@@ -309,39 +333,29 @@ impl<T> VecOption<T> {
     /// assert_eq!(v.into_iter().collect::<Vec<Option<char>>>(), vec![Some('A'), Some('B')])
     /// ```
     pub fn compact(&mut self) -> &mut [T] {
-        let len = self.present.len();
-        let items_ptr = self.vec.as_mut_ptr();
-        let mut num_keep = 0;
+        assert_eq!(self.present.len(), self.vec.len());
+        let old_len = self.present.len();
+        let mut new_len = 0;
         for (i, item_present) in self.present.iter().enumerate() {
             if item_present {
-                if i != num_keep {
+                if i != new_len {
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            items_ptr.add(i),
-                            items_ptr.add(num_keep),
-                            1,
-                        );
+                        let item = core::ptr::read(self.vec[i].as_ptr());
+                        core::ptr::write(self.vec[new_len].as_mut_ptr(), item);
                     }
                 }
-                num_keep += 1;
+                new_len += 1;
             }
         }
-        if num_keep != len {
-            for i in 0..num_keep {
-                self.present.set(i, true);
-            }
-            for i in num_keep..len {
-                self.present.set(i, false);
-            }
-            // Change the length of the collection
-            unsafe {
-                self.vec.set_len(num_keep);
-            }
-            self.present.truncate(num_keep);
+        if new_len != old_len {
+            // Change the length of the collection.
+            self.vec.truncate(new_len);
+            self.present.truncate(new_len);
+            self.present.set_all();
         }
 
         // This is the only time this is safe, because we know that present[0..len] = true.
-        &mut self.vec
+        unsafe { core::slice::from_raw_parts_mut(self.vec.as_mut_ptr() as *mut T, new_len) }
     }
 
     /// Finds all of the `Some` values within the `VecOption<T>` and moves them so that they are
@@ -366,16 +380,15 @@ impl<T> VecOption<T> {
         // We extract the vec because we are going to return it to the caller.
         // But we also extract the 'present' bit vector so that the Drop impl
         // doesn't run 'drop' on elements that have been moved.
-        let new_len = self.compact().len();
-        let mut vec = core::mem::replace(&mut self.vec, Vec::new());
+        self.compact();
+        let vec = core::mem::replace(&mut self.vec, Vec::new());
         core::mem::replace(&mut self.present, BitVec::new());
         unsafe {
-            vec.set_len(new_len);
+            vec_uninit_to_vec(vec)
         }
-        vec
     }
 
-    /// Gets a reference to a item, by index.
+    /// Gets a reference to an item, by index.
     /// The index is required be valid (less than `len()`);
     /// if the index is out of bounds then this method will panic.
     ///
@@ -389,13 +402,13 @@ impl<T> VecOption<T> {
     /// ```
     pub fn get_ref(&mut self, index: usize) -> Option<&T> {
         if self.present[index] {
-            Some(unsafe { &*self.vec.as_ptr().add(index) })
+            Some(unsafe { &*self.vec[index].as_ptr() })
         } else {
             None
         }
     }
 
-    /// Gets a mutable reference to a item, by index.
+    /// Gets a mutable reference to an item, by index.
     /// The index is required be valid (less than `len()`);
     /// if the index is out of bounds then this method will panic.
     ///
@@ -410,7 +423,7 @@ impl<T> VecOption<T> {
     /// ```
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         if self.present[index] {
-            Some(unsafe { &mut *self.vec.as_mut_ptr().add(index) })
+            Some(unsafe { &mut *self.vec[index].as_mut_ptr() })
         } else {
             None
         }
@@ -480,13 +493,13 @@ impl<T> VecOption<T> {
     /// ```
     pub fn replace_some(&mut self, index: usize, value: T) -> Option<T> {
         let old_value = if self.present[index] {
-            Some(unsafe { core::ptr::read(self.vec.as_ptr().add(index)) })
+            Some(unsafe { core::ptr::read(self.vec[index].as_ptr()) })
         } else {
             self.present.set(index, true);
             None
         };
         unsafe {
-            core::ptr::write(self.vec.as_mut_ptr().add(index), value);
+            core::ptr::write(self.vec[index].as_mut_ptr(), value);
         }
         old_value
     }
@@ -504,7 +517,7 @@ impl<T> VecOption<T> {
     pub fn replace_none(&mut self, index: usize) -> Option<T> {
         if self.present[index] {
             self.present.set(index, false);
-            Some(unsafe { core::ptr::read(self.vec.as_ptr().add(index)) })
+            Some(unsafe { core::ptr::read(self.vec[index].as_ptr()) })
         } else {
             None
         }
@@ -532,56 +545,48 @@ impl<T> VecOption<T> {
 
     /// Iterates the vector as `Option<&T>`.
     pub fn iter(&self) -> impl Iterator<Item = Option<&T>> + '_ {
-        self.present.iter().enumerate().map(move |(i, is_present)| {
+        self.present.iter().zip(self.vec.iter()).map(|(is_present, maybe_item)|
             if is_present {
-                Some(unsafe { &*self.vec.as_ptr().add(i) })
+                Some(unsafe { &*maybe_item.as_ptr() })
             } else {
                 None
             }
-        })
+        )
     }
 
     /// Iterates the vector as `Option<&mut T>`.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = Option<&mut T>> + '_ {
-        let items_ptr = self.vec.as_mut_ptr();
-        self.present.iter().enumerate().map(move |(i, is_present)| {
+        self.present.iter().zip(self.vec.iter_mut()).map(|(is_present, maybe_item)|
             if is_present {
-                Some(unsafe { &mut *items_ptr.add(i) })
+                Some(unsafe { &mut *maybe_item.as_mut_ptr() })
             } else {
                 None
             }
-        })
+        )
     }
 
     /// Iterates only the `Some` items in the vector, as `(index, &T)`,
     /// where `index` is the index of each such item.
     pub fn iter_some_index(&self) -> impl Iterator<Item = (usize, &T)> + '_ {
-        self.present
-            .iter()
-            .enumerate()
-            .flat_map(move |(i, is_present)| {
-                if is_present {
-                    Some((i, unsafe { &*self.vec.as_ptr().add(i) }))
-                } else {
-                    None
-                }
-            })
+        self.present.iter().zip(self.vec.iter()).enumerate().flat_map(|(index, (is_present, maybe_item))|
+            if is_present {
+                Some((index, unsafe { &*maybe_item.as_ptr() }))
+            } else {
+                None
+            }
+        )
     }
 
     /// Iterates only the `Some` items in the vector, as `&mut T`,
     /// where `index` is the index of each such item.
     pub fn iter_some_index_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> + '_ {
-        let items_ptr = self.vec.as_mut_ptr();
-        self.present
-            .iter()
-            .enumerate()
-            .flat_map(move |(i, is_present)| {
-                if is_present {
-                    Some((i, unsafe { &mut *items_ptr.add(i) }))
-                } else {
-                    None
-                }
-            })
+        self.present.iter().zip(self.vec.iter_mut()).enumerate().flat_map(|(index, (is_present, maybe_item))|
+            if is_present {
+                Some((index, unsafe { &mut *maybe_item.as_mut_ptr() }))
+            } else {
+                None
+            }
+        )
     }
 
     /// Iterates contiguous runs of `Some` items as `&[T]`.
@@ -656,7 +661,7 @@ impl<T> VecOption<T> {
     /// ```
     pub fn push_some(&mut self, value: T) {
         self.present.push(true);
-        self.vec.push(value);
+        self.vec.push(MaybeUninit::new(value));
     }
 
     /// Pushes a new `None` value onto the end of the vector.
@@ -687,13 +692,10 @@ impl<T> VecOption<T> {
     pub fn pop(&mut self) -> Option<Option<T>> {
         assert_eq!(self.vec.len(), self.present.len());
         if let Some(last_is_present) = self.present.pop() {
+            let maybe_item = self.vec.pop().unwrap();
             if last_is_present {
-                Some(self.vec.pop())
+                Some(Some(unsafe { maybe_item.assume_init() }))
             } else {
-                let new_len = self.vec.len() - 1;
-                unsafe {
-                    self.vec.set_len(new_len);
-                }
                 Some(None)
             }
         } else {
@@ -755,7 +757,7 @@ impl<'a, T> Iterator for IterRuns<'a, T> {
         if range.start < range.end {
             Some(unsafe {
                 core::slice::from_raw_parts(
-                    self.vec.vec.as_ptr().add(range.start),
+                    self.vec.vec[range.start].as_ptr(),
                     range.end - range.start,
                 )
             })
@@ -779,7 +781,7 @@ impl<'a, T> Iterator for IterRunsMut<'a, T> {
         if range.start < range.end {
             Some(unsafe {
                 core::slice::from_raw_parts_mut(
-                    self.vec.vec.as_mut_ptr().add(range.start),
+                    self.vec.vec[range.start].as_mut_ptr(),
                     range.end - range.start,
                 )
             })
@@ -799,9 +801,6 @@ impl<T> Drop for VecOption<T> {
                     }
                 }
             }
-        }
-        unsafe {
-            self.vec.set_len(0);
         }
     }
 }
@@ -842,6 +841,16 @@ impl<T> Iterator for IntoIter<T> {
         } else {
             None
         }
+    }
+}
+
+impl<T> Drop for IntoIter<T> {
+    fn drop(&mut self) {
+        while let Some(_) = self.next() {
+            // drop the item
+        }
+        self.vec.vec.clear();
+        self.vec.present.clear();
     }
 }
 
@@ -914,4 +923,19 @@ impl<T> Iterator for IntoSomeIter<T> {
             }
         }
     }
+}
+
+#[test]
+fn compact_test() {
+    let mut v = VecOption::new_repeat_none(5);
+    assert_eq!(
+        v.iter().collect::<Vec<Option<&char>>>(),
+        vec![None, None, None, None, None]);
+    v.set_some(1, 'A');
+    v.set_some(4, 'B');
+    assert_eq!(
+        v.iter().collect::<Vec<Option<&char>>>(),
+        vec![None, Some(&'A'), None, None, Some(&'B')]);
+    assert_eq!(v.compact(), &['A', 'B']);
+    assert_eq!(v.into_iter().collect::<Vec<Option<char>>>(), vec![Some('A'), Some('B')])
 }
