@@ -1,6 +1,6 @@
-/// [VecOption] is a collection that is semantically equivalent to `Vec<Option<T>>` but which
-/// uses a different memory representation. This representation can be more efficient
-/// for some algorithms.
+//! [VecOption] is a collection that is semantically equivalent to `Vec<Option<T>>` but which
+//! uses a different memory representation. This representation can be more efficient
+//! for some algorithms.
 
 use bit_vec::BitVec;
 use core::ops::Range;
