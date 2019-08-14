@@ -8,17 +8,17 @@ use core::ops::Range;
 /// `VecOption` is a collection that is semantically equivalent to `Vec<Option<T>>` but which
 /// uses a different memory representation. This representation can be more efficient
 /// for some algorithms.
-/// 
+///
 /// `VecOption` represents its state by using two allocations: a `Vec<T>` containing items
 /// (some of which are initialized and some of which are not) and a parallel bit vector,
 /// called the `Some` vector, which indicates whether the corresponding item in the items
 /// vector is present or absent.
-/// 
+///
 /// This representation has many advantages:
 ///
 /// * A `Vec<T>` can be converted to a `VecOption<T>` where each item becomes a `Some` item.
 ///   This is done simply by allocating the `Some` bit vector; the items vector does not change.
-/// 
+///
 /// * A `VecOption<T>` can be compacted and converted to a `Vec<T>`. All of the `Some` items
 ///   are moved so that they are contiguous and aligned with the beginning of the `Vec<T>`
 ///   allocation, and the `Some` bit vector is discarded. Compaction is done without reallocation.
@@ -34,21 +34,21 @@ use core::ops::Range;
 ///
 /// `VecOption` is well-suited to algorithms such as "remove items from a vector using a given
 /// permutation", while minimizing memory copying.
-/// 
+///
 /// To the degree that is practical, `VecOption` imitates the methods and semantics of `Vec`.
 /// It never does implicit compaction or movement of items. `VecOption` has a length, has
 /// items at fixed indices, and can iterate and access items in much the same way that `Vec`
 /// does. However, there are exceptions:
-/// 
+///
 /// * `VecOption` does not (cannot) implement `Index` or `IndexMut`. These require returning
 ///   a reference, and the only sensible return type would be `&Option<T>`. However, because
 ///   the data representation of `VecOption` does not use `Option`, this is impossible.
 ///   Instead, methods such as `VecOption::get` return `Option<&T>`.
-/// 
+///
 /// * Implicit conversion (`Deref`) to `&[Option<T>]` is not feasible, for similar reasons.
 ///   However, some common operations are provided which can return `&[T]` for _runs_ of
 ///   `Some` values.
-/// 
+///
 /// `VecOption` is a specialized data type, useful only in certain situations. It is not
 /// intended to be a general-purpose data type; that is precisely the role of `Vec`.
 pub struct VecOption<T> {
@@ -86,6 +86,12 @@ impl<T: Clone> Clone for VecOption<T> {
     }
 }
 
+impl<T> Default for VecOption<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: PartialEq<T>> PartialEq<VecOption<T>> for VecOption<T> {
     fn eq(&self, rhs: &VecOption<T>) -> bool {
         if self.len() != rhs.len() {
@@ -96,7 +102,7 @@ impl<T: PartialEq<T>> PartialEq<VecOption<T>> for VecOption<T> {
                 return false;
             }
         }
-        return true;
+        true
     }
 }
 
@@ -424,7 +430,7 @@ impl<T> VecOption<T> {
     where
         T: Copy,
     {
-        self.get_ref(index).map(|v| *v)
+        self.get_ref(index).copied()
     }
 
     /// Gets a clone of an item, by index.
@@ -441,7 +447,7 @@ impl<T> VecOption<T> {
     where
         T: Clone,
     {
-        self.get_ref(index).map(|v| v.clone())
+        self.get_ref(index).cloned()
     }
 
     /// Sets an item in the vector, taking `Option<T>`.
@@ -603,7 +609,7 @@ impl<T> VecOption<T> {
     }
 
     /// Iterates contiguous runs of `Some` items as `&mut [T]`.
-    /// 
+    ///
     /// Example:
     ///
     /// ```
@@ -677,6 +683,7 @@ impl<T> VecOption<T> {
 
     /// Pops the last entry on the stack. This behaves exactly as though
     /// `VecOption<T>` were `Vec<Option<T>>`.
+    #[allow(clippy::option_option)]
     pub fn pop(&mut self) -> Option<Option<T>> {
         assert_eq!(self.vec.len(), self.present.len());
         if let Some(last_is_present) = self.present.pop() {
