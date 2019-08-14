@@ -1,0 +1,8 @@
+[package]
+name = "vec_option"
+version = "0.1.0"
+authors = ["Arlie Davis <arlie.davis@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+bit-vec = "0.1"
